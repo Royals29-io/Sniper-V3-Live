@@ -16,5 +16,7 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      - key: TEST_KEY
+        sync: false
       - key: ENABLE_LIVE_SIGNALS
         value: "false"
