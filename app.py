@@ -1,13 +1,15 @@
 
+import hmac
 import json
 import os
 import threading
 import time
 from datetime import datetime, timezone
+from html import escape
 
 import requests
 import websocket
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
@@ -17,8 +19,6 @@ DERIV_WS_URL = (
     f"?app_id={DERIV_APP_ID}"
 )
 
-# Preferred instruments. Only symbols actually returned by Deriv
-# will be considered. The final list is limited to 14 instruments.
 PREFERRED_SYMBOLS = [
     "R_100", "R_75", "R_50", "R_25", "R_10",
     "1HZ100V", "1HZ75V", "1HZ50V", "1HZ25V", "1HZ10V",
@@ -28,6 +28,7 @@ PREFERRED_SYMBOLS = [
 
 lock = threading.RLock()
 started_at = time.time()
+last_telegram_test = 0.0
 
 state = {
     "service": "Sniper V3 Pro",
@@ -35,13 +36,9 @@ state = {
     "signals_enabled": False,
     "deriv_connected": False,
     "catalogue_loaded": False,
-    "telegram_configured": bool(
-        os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        and os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    ),
+    "telegram_configured": False,
     "last_message": "Waiting for Deriv connection",
     "last_tick_at": None,
-    "last_tick_age_seconds": None,
     "instruments": {},
     "available_candidate_count": 0,
     "subscribed_count": 0,
@@ -66,29 +63,22 @@ def choose_instruments(catalogue):
         symbol = item.get("symbol")
         if not symbol:
             continue
-
-        # Do not subscribe to suspended markets.
         if item.get("is_trading_suspended") is True:
             continue
-
         by_symbol[symbol] = item
 
-    chosen = []
+    chosen = [
+        symbol for symbol in PREFERRED_SYMBOLS
+        if symbol in by_symbol
+    ]
 
-    # Prefer the requested, known symbol identifiers.
-    for symbol in PREFERRED_SYMBOLS:
-        if symbol in by_symbol and symbol not in chosen:
-            chosen.append(symbol)
-
-    # Discover possible Step and Gold instruments from the live
-    # catalogue if their symbol identifiers differ.
     for symbol, item in by_symbol.items():
         display = str(item.get("display_name", "")).lower()
-        category = str(item.get("market", "")).lower()
+        market = str(item.get("market", "")).lower()
 
         if (
             "step" in display
-            or "step" in category
+            or "step" in market
             or "gold" in display
             or "xau" in symbol.lower()
         ):
@@ -101,9 +91,8 @@ def choose_instruments(catalogue):
 def on_open(ws):
     with lock:
         state["deriv_connected"] = True
-        state["last_message"] = "Connected; requesting active markets"
+        state["last_message"] = "Connected; requesting market catalogue"
 
-    # Discover markets from the live API rather than assuming symbols.
     ws.send(json.dumps({
         "active_symbols": "brief",
         "product_type": "basic",
@@ -121,7 +110,8 @@ def on_message(ws, message):
     if data.get("error"):
         error = data["error"]
         record_error(
-            f"Deriv API error: {error.get('code', 'unknown')} - "
+            "Deriv API error: "
+            f"{error.get('code', 'unknown')} - "
             f"{error.get('message', 'No description')}"
         )
         return
@@ -149,7 +139,7 @@ def on_message(ws, message):
                 for symbol in chosen
             }
             state["last_message"] = (
-                f"Catalogue loaded; found {len(chosen)} candidate markets"
+                f"Catalogue loaded; found {len(chosen)} candidates"
             )
 
         for index, symbol in enumerate(chosen, start=10):
@@ -166,10 +156,7 @@ def on_message(ws, message):
             state["subscribed_count"] = len(chosen)
 
         if not chosen:
-            record_error(
-                "No preferred markets found in the current catalogue"
-            )
-
+            record_error("No preferred candidate markets were found")
         return
 
     if msg_type == "tick":
@@ -181,29 +168,27 @@ def on_message(ws, message):
         if not symbol or price is None:
             return
 
-        tick_time = (
-            datetime.fromtimestamp(epoch, timezone.utc).isoformat()
-            if isinstance(epoch, (int, float))
-            else datetime.now(timezone.utc).isoformat()
-        )
+        if isinstance(epoch, (int, float)):
+            tick_time = datetime.fromtimestamp(
+                epoch, timezone.utc
+            ).isoformat()
+        else:
+            tick_time = datetime.now(timezone.utc).isoformat()
 
         with lock:
             instrument = state["instruments"].get(symbol)
-
             if instrument is not None:
                 instrument["tick_count"] += 1
                 instrument["last_price"] = price
                 instrument["last_tick_at"] = tick_time
+                instrument["subscribed"] = True
                 state["last_tick_at"] = tick_time
-                state["last_message"] = "Receiving live market ticks"
-
+                state["last_message"] = "Receiving market ticks"
         return
 
     if msg_type == "subscription":
         subscription = data.get("subscription", {})
-        subscription_id = subscription.get("id")
-
-        if subscription_id:
+        if subscription.get("id"):
             with lock:
                 state["last_message"] = "Market subscription confirmed"
 
@@ -233,12 +218,10 @@ def deriv_connection_loop():
                 on_error=on_error,
                 on_close=on_close,
             )
-
             client.run_forever(
                 ping_interval=30,
                 ping_timeout=10,
             )
-
         except Exception as exc:
             record_error(f"Connection loop error: {exc}")
 
@@ -246,6 +229,36 @@ def deriv_connection_loop():
             state["deriv_connected"] = False
 
         time.sleep(5)
+
+
+def send_telegram_message(message):
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    if not token or not chat_id:
+        return False, "Telegram credentials are not configured"
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    try:
+        response = requests.post(
+            url,
+            json={
+                "chat_id": chat_id,
+                "text": message,
+            },
+            timeout=15,
+        )
+        result = response.json()
+
+        if response.ok and result.get("ok") is True:
+            return True, "Telegram accepted the message"
+
+        description = result.get("description", "Telegram rejected message")
+        return False, str(description)[:200]
+
+    except (requests.RequestException, ValueError) as exc:
+        return False, f"Telegram request failed: {str(exc)[:150]}"
 
 
 def start_background_connection():
@@ -265,9 +278,11 @@ def home():
         "<title>Sniper V3 Pro</title></head><body>"
         "<h1>Sniper V3 Pro</h1>"
         "<p>Diagnostics service is running.</p>"
-        "<p>Trading signals are disabled.</p>"
-        "<p>Open <a href='/health'>Health</a> or "
-        "<a href='/status'>Status</a> to inspect service diagnostics.</p>"
+        "<p>Live trading signals are disabled.</p>"
+        "<p><a href='/health'>Health</a> | "
+        "<a href='/status'>Status</a> | "
+        "<a href='/telegram-config'>Telegram configuration</a></p>"
+        "<p><a href='/test-telegram'>Open Telegram test</a></p>"
         "</body></html>"
     )
 
@@ -291,11 +306,10 @@ def status():
         result = json.loads(json.dumps(state))
 
     result["uptime_seconds"] = int(time.time() - started_at)
-
     now = datetime.now(timezone.utc)
+
     for instrument in result["instruments"].values():
         tick_time = instrument.get("last_tick_at")
-
         if tick_time:
             try:
                 tick_dt = datetime.fromisoformat(
@@ -314,7 +328,6 @@ def status():
 
 @app.route("/telegram-config")
 def telegram_config():
-    # Reports configuration presence only. Never returns credentials.
     token_present = bool(
         os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     )
@@ -325,11 +338,72 @@ def telegram_config():
     return jsonify({
         "telegram_token_configured": token_present,
         "telegram_chat_id_configured": chat_id_present,
-        "ready_to_test": token_present and chat_id_present,
-        "note": "No message is sent by this endpoint.",
+        "test_key_configured": bool(
+            os.getenv("TEST_KEY", "").strip()
+        ),
+        "ready_to_test": (
+            token_present
+            and chat_id_present
+            and bool(os.getenv("TEST_KEY", "").strip())
+        ),
     }), 200
 
 
-# Gunicorn is configured with one worker for this initial test service.
-# Signal generation and automatic trading are intentionally absent.
+@app.route("/test-telegram", methods=["GET", "POST"])
+def test_telegram():
+    global last_telegram_test
+
+    if request.method == "GET":
+        return (
+            "<!doctype html><html><head>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<title>Telegram Test</title></head><body>"
+            "<h1>Sniper V3 Pro - Telegram Test</h1>"
+            "<p>This sends one test message to your configured chat.</p>"
+            "<form method='post' action='/test-telegram'>"
+            "<label>Test key: "
+            "<input name='test_key' type='password' required "
+            "autocomplete='off'></label>"
+            "<button type='submit'>Send test message</button>"
+            "</form></body></html>"
+        )
+
+    expected_key = os.getenv("TEST_KEY", "").strip()
+    supplied_key = request.form.get("test_key", "").strip()
+
+    if not expected_key:
+        return "TEST_KEY has not been configured in Render.", 503
+
+    if not hmac.compare_digest(supplied_key, expected_key):
+        return "Unauthorized. Check your test key.", 401
+
+    with lock:
+        now = time.time()
+        if now - last_telegram_test < 30:
+            return "Please wait 30 seconds before another test.", 429
+        last_telegram_test = now
+
+    message = (
+        "SNIPER V3 PRO\n\n"
+        "Telegram delivery test successful.\n"
+        "This is a connection test, not a trading signal.\n"
+        "Live signals remain disabled."
+    )
+
+    success, detail = send_telegram_message(message)
+
+    if success:
+        return (
+            "<h2>Test message sent successfully.</h2>"
+            "<p>Check your Telegram chat.</p>"
+        ), 200
+
+    record_error(f"Telegram test failed: {detail}")
+    return (
+        "<h2>Telegram test failed.</h2>"
+        f"<p>{escape(detail)}</p>"
+        "<p>Check the Render environment variables and service logs.</p>"
+    ), 502
+
+
 start_background_connection()
