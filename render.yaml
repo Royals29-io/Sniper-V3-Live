@@ -1,0 +1,20 @@
+
+services:
+  - type: web
+    name: sniper-v3-pro
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --workers 1 --threads 4 --timeout 120 app:app
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: DERIV_APP_ID
+        value: "1089"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: ENABLE_LIVE_SIGNALS
+        value: "false"
