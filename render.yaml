@@ -9,7 +9,7 @@ services:
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.11
+        value: "3.11.11"
       - key: DERIV_APP_ID
         value: "1089"
       - key: TELEGRAM_BOT_TOKEN
