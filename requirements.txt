@@ -1,4 +1,0 @@
-Flask
-requests
-pytz
-websocket-client
